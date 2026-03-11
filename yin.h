@@ -1,6 +1,8 @@
 #ifndef YIN_H
 #define YIN_H
 
+#include <stdbool.h>
+
 #ifdef _WIN32
 #define YIN_EXPORT __declspec(dllexport)
 #else
@@ -12,65 +14,42 @@ extern "C"
 {
 #endif
 
-    typedef struct YinContext
+    // Struct to hold per-frame data, matching the Python logic
+    typedef struct
     {
-        int max_tau;   // maximum tau supported (buffer size - 1)
-        float *d;      // difference function buffer [0..max_tau]
-        float *dprime; // CMNDF buffer [0..max_tau]
-    } YinContext;
+        float time_s;
+        float frequency_hz;
+        float confidence;
+        char note[5];
+        int octave;
+        char note_with_octave[10];
+        int midi;
+        float cents_error;
+        bool in_key;
+    } FrameAnnotation;
 
-    typedef struct YinPitch
-    {
-        float f0;           // estimated fundamental frequency (Hz)
-        float tau;          // estimated period (samples), fractional after interpolation
-        float confidence;   // simple proxy: 1 - aperiodicity
-        float aperiodicity; // d'(tau_int) at chosen tau (lower is better)
-        int t_used;         // frame start index actually used (after step 6)
-    } YinPitch;
-
-    // Allocate reusable buffers for up to max_tau (inclusive)
-    YIN_EXPORT YinContext *yin_create(int max_tau);
-
-    // Free buffers
-    YIN_EXPORT void yin_destroy(YinContext *ctx);
-
-    /**
-     * Detect pitch using YIN (steps 2–6).
-     *
-     * signal: pointer to mono float samples
-     * length: number of samples in signal
-     * sr: sample rate (Hz)
-     * t: frame start sample index
-     * W: window length (samples)
-     * tau_min/tau_max: lag search bounds (samples)
-     * thresh: absolute threshold (typical ~0.1)
-     *
-     * Step 6 params:
-     * local_radius: +/- samples around t to search (0 disables step 6)
-     * local_step: stride within neighborhood
-     * refine_radius: second pass tight search around best tau (in lag samples)
-     *
-     * out: result struct
-     *
-     * returns 1 on success, 0 if not enough samples / invalid params
-     */
-    YIN_EXPORT int yin_detect_pitch(
-        YinContext *ctx,
-        const float *signal,
-        int length,
-        float sr,
-        int t,
-        int W,
-        int tau_min,
-        int tau_max,
+    // Batch processes an audio buffer
+    YIN_EXPORT void process_audio_frames(
+        const float *audio,
+        int num_samples,
+        int sr,
+        int tonic_pc,
+        const int *scale_intervals,
+        int num_scale_intervals,
+        float fmin,
+        float fmax,
+        int frame_size,
+        int hop_size,
         float thresh,
-        int local_radius,
-        int local_step,
-        int refine_radius,
-        YinPitch *out);
+        float conf_thresh,
+        FrameAnnotation **out_annotations,
+        int *out_count);
+
+    // Required to prevent memory leaks in Unity
+    YIN_EXPORT void free_annotations(FrameAnnotation *annotations);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // YIN_H
+#endif

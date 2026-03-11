@@ -1,273 +1,258 @@
 #include "yin.h"
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
 
-static float clampf(float x, float a, float b)
+// Constants and Data
+static const char *NOTE_NAMES_SHARP[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+static const int SCALE_MAJOR[] = {0, 2, 4, 5, 7, 9, 11};
+
+// --- Internal Helper Functions ---
+
+static float hz_to_midi(float freq)
 {
-    return (x < a) ? a : (x > b) ? b
-                                 : x;
+    if (freq <= 0)
+        return 0;
+    return 69.0f + 12.0f * log2f(freq / 440.0f);
 }
 
-// ---------- Step 2: difference function d(tau) ----------
-static void difference_function(
-    const float *x, // frame pointer (must have W + tau_max samples available)
-    int W,
-    int tau_max,
-    float *d_out // [0..tau_max]
-)
+static uint16_t build_key_mask(int tonic_pc, const int *intervals, int num_intervals)
 {
-    d_out[0] = 0.0f;
-    for (int tau = 1; tau <= tau_max; ++tau)
+    uint16_t mask = 0;
+    for (int i = 0; i < num_intervals; i++)
     {
-        float sum = 0.0f;
-        const float *a = x;
-        const float *b = x + tau;
-        for (int j = 0; j < W; ++j)
+        mask |= (1 << ((tonic_pc + intervals[i]) % 12));
+    }
+    return mask;
+}
+
+// --- YIN Core Steps ---
+
+void difference_function(const float *buffer, int W, int tau_max, float *d)
+{
+    for (int tau = 0; tau <= tau_max; tau++)
+    {
+        d[tau] = 0.0f;
+        for (int j = 0; j < W; j++)
         {
-            float diff = a[j] - b[j];
-            sum += diff * diff;
+            float tmp = buffer[j] - buffer[j + tau];
+            d[tau] += tmp * tmp;
         }
-        d_out[tau] = sum;
     }
 }
 
-// ---------- Step 3: CMNDF d'(tau) ----------
-static void cmndf(const float *d, int tau_max, float *dprime_out)
+void cmndf(float *d, int tau_max)
 {
-    dprime_out[0] = 1.0f;
-
-    float cumsum = 0.0f;
-    const float eps = 1e-12f;
-
-    for (int tau = 1; tau <= tau_max; ++tau)
+    d[0] = 1.0f;
+    float running_sum = 0.0f;
+    for (int tau = 1; tau <= tau_max; tau++)
     {
-        cumsum += d[tau];
-        float mean = cumsum / (float)tau;
-        if (mean > eps)
+        running_sum += d[tau];
+        if (running_sum > 0)
+            d[tau] = d[tau] / (running_sum / tau);
+        else
+            d[tau] = 1.0f;
+    }
+}
+
+int absolute_threshold(float *d, int tau_min, int tau_max, float thresh)
+{
+    for (int tau = tau_min; tau <= tau_max; tau++)
+    {
+        if (d[tau] < thresh)
         {
-            dprime_out[tau] = d[tau] / mean;
+            while (tau + 1 <= tau_max && d[tau + 1] < d[tau])
+                tau++;
+            return tau;
+        }
+    }
+    int min_tau = tau_min;
+    for (int tau = tau_min + 1; tau <= tau_max; tau++)
+    {
+        if (d[tau] < d[min_tau])
+            min_tau = tau;
+    }
+    return min_tau;
+}
+
+float parabolic_interpolation(const float *d, int tau, int tau_max)
+{
+    if (tau <= 0 || tau >= tau_max)
+        return (float)tau;
+    float s0 = d[tau - 1], s1 = d[tau], s2 = d[tau + 1];
+    float denom = s0 - 2.0f * s1 + s2;
+    if (fabsf(denom) < 1e-20f)
+        return (float)tau;
+    return (float)tau + 0.5f * (s0 - s2) / denom;
+}
+
+// --- Primary Entry Point (Unity & Main) ---
+
+void process_audio_frames(
+    const float *audio, int num_samples, int sr,
+    int tonic_pc, const int *scale_intervals, int num_scale_intervals,
+    float fmin, float fmax, int frame_size, int hop_size, float thresh, float conf_thresh,
+    FrameAnnotation **out_annotations, int *out_count)
+{
+    int tau_min = (int)fmaxf(2.0f, (float)sr / fmax);
+    int tau_max = (int)((float)sr / fmin);
+
+    int max_start = num_samples - (frame_size + tau_max);
+    if (max_start <= 0)
+    {
+        *out_count = 0;
+        return;
+    }
+
+    int total_frames = (max_start / hop_size) + 1;
+    *out_annotations = (FrameAnnotation *)malloc(total_frames * sizeof(FrameAnnotation));
+    *out_count = total_frames;
+
+    float *d = (float *)malloc((tau_max + 1) * sizeof(float));
+    uint16_t key_mask = build_key_mask(tonic_pc, scale_intervals, num_scale_intervals);
+
+    for (int i = 0; i < total_frames; i++)
+    {
+        int start = i * hop_size;
+        difference_function(&audio[start], frame_size, tau_max, d);
+        cmndf(d, tau_max);
+
+        int tau_int = absolute_threshold(d, tau_min, tau_max, thresh);
+        float tau_hat = parabolic_interpolation(d, tau_int, tau_max);
+
+        float aperiodicity = d[tau_int];
+        float confidence = fmaxf(0.0f, fminf(1.0f, 1.0f - aperiodicity));
+        float f0 = (tau_hat > 0.0f) ? ((float)sr / tau_hat) : 0.0f;
+
+        FrameAnnotation *ann = &(*out_annotations)[i];
+        ann->time_s = (float)start / sr;
+        ann->confidence = confidence;
+
+        if (confidence >= conf_thresh && f0 >= fmin && f0 <= fmax)
+        {
+            ann->frequency_hz = f0;
+            float midi_float = hz_to_midi(f0);
+            int midi_round = (int)roundf(midi_float);
+
+            ann->cents_error = (midi_float - (float)midi_round) * 100.0f;
+            ann->midi = midi_round;
+            int pitch_class = midi_round % 12;
+            ann->octave = (midi_round / 12) - 1;
+
+            strncpy(ann->note, NOTE_NAMES_SHARP[pitch_class], 5);
+            snprintf(ann->note_with_octave, 10, "%s%d", ann->note, ann->octave);
+            ann->in_key = (key_mask & (1 << pitch_class)) != 0;
         }
         else
         {
-            dprime_out[tau] = 1.0f; // silence / degenerate
+            ann->frequency_hz = -1.0f;
+            ann->midi = -1;
+            ann->octave = -1;
+            strcpy(ann->note, "-");
+            strcpy(ann->note_with_octave, "-");
+            ann->in_key = false;
         }
     }
+    free(d);
 }
 
-// ---------- Step 4: absolute threshold + local min ----------
-static int absolute_threshold(
-    const float *dprime,
-    int tau_min,
-    int tau_max,
-    float thresh)
+void free_annotations(FrameAnnotation *annotations)
 {
-    int tau = -1;
-
-    for (int t = tau_min; t <= tau_max; ++t)
-    {
-        if (dprime[t] < thresh)
-        {
-            tau = t;
-            break;
-        }
-    }
-
-    if (tau < 0)
-    {
-        // fallback: global min in range
-        int best = tau_min;
-        float bestv = dprime[tau_min];
-        for (int t = tau_min + 1; t <= tau_max; ++t)
-        {
-            if (dprime[t] < bestv)
-            {
-                bestv = dprime[t];
-                best = t;
-            }
-        }
-        return best;
-    }
-
-    // move to local minimum (while decreasing)
-    while (tau + 1 <= tau_max && dprime[tau + 1] < dprime[tau])
-    {
-        tau++;
-    }
-
-    return tau;
+    if (annotations)
+        free(annotations);
 }
 
-// ---------- Step 5: parabolic interpolation ----------
-static float parabolic_interpolation(const float *y, int n, int i)
+// --- Improved WAV Loader (Correctly finds DATA chunk) ---
+
+float *load_wav_mono(const char *filename, int *out_num_samples, int *out_sr)
 {
-    if (i <= 0 || i >= n - 1)
-        return (float)i;
-
-    float y0 = y[i - 1];
-    float y1 = y[i];
-    float y2 = y[i + 1];
-
-    float denom = (y0 - 2.0f * y1 + y2);
-    if (fabsf(denom) < 1e-20f)
-        return (float)i;
-
-    float delta = 0.5f * (y0 - y2) / denom;
-    // delta typically in [-0.5, 0.5] for well-shaped minima
-    return (float)i + delta;
-}
-
-static int yin_one_frame(
-    YinContext *ctx,
-    const float *signal,
-    int length,
-    float sr,
-    int t,
-    int W,
-    int tau_min,
-    int tau_max,
-    float thresh,
-    YinPitch *out)
-{
-    // Need samples: t .. t + W + tau_max - 1
-    int needed = t + W + tau_max;
-    if (t < 0 || needed > length)
-        return 0;
-
-    const float *x = signal + t;
-
-    difference_function(x, W, tau_max, ctx->d);
-    cmndf(ctx->d, tau_max, ctx->dprime);
-
-    int tau_int = absolute_threshold(ctx->dprime, tau_min, tau_max, thresh);
-    float tau_hat = parabolic_interpolation(ctx->dprime, tau_max + 1, tau_int);
-
-    float ap = ctx->dprime[tau_int];
-    float conf = 1.0f - ap;
-    conf = clampf(conf, 0.0f, 1.0f);
-
-    out->tau = tau_hat;
-    out->f0 = (tau_hat > 0.0f) ? (sr / tau_hat) : 0.0f;
-    out->aperiodicity = ap;
-    out->confidence = conf;
-    out->t_used = t;
-    return 1;
-}
-
-// ---------- Public API ----------
-YinContext *yin_create(int max_tau)
-{
-    if (max_tau < 1)
+    FILE *f = fopen(filename, "rb");
+    if (!f)
         return NULL;
 
-    YinContext *ctx = (YinContext *)calloc(1, sizeof(YinContext));
-    if (!ctx)
-        return NULL;
+    char chunk_id[4];
+    uint32_t chunk_size;
 
-    ctx->max_tau = max_tau;
-    ctx->d = (float *)malloc((size_t)(max_tau + 1) * sizeof(float));
-    ctx->dprime = (float *)malloc((size_t)(max_tau + 1) * sizeof(float));
+    // Read RIFF Header
+    fseek(f, 12, SEEK_SET);
 
-    if (!ctx->d || !ctx->dprime)
+    // Search for "fmt " chunk
+    while (fread(chunk_id, 1, 4, f) == 4)
     {
-        yin_destroy(ctx);
-        return NULL;
+        fread(&chunk_size, 4, 1, f);
+        if (memcmp(chunk_id, "fmt ", 4) == 0)
+        {
+            fseek(f, 4, SEEK_CUR); // skip audio format
+            uint16_t channels;
+            fread(&channels, 2, 1, f);
+            uint32_t sr;
+            fread(&sr, 4, 1, f);
+            *out_sr = (int)sr;
+            fseek(f, chunk_size - 10, SEEK_CUR); // skip rest of fmt
+        }
+        else if (memcmp(chunk_id, "data", 4) == 0)
+        {
+            int16_t *pcm_data = (int16_t *)malloc(chunk_size);
+            int read = fread(pcm_data, 1, chunk_size, f);
+            int samples = read / 2;
+            float *float_data = (float *)malloc(samples * sizeof(float));
+            for (int i = 0; i < samples; i++)
+                float_data[i] = pcm_data[i] / 32768.0f;
+            *out_num_samples = samples;
+            free(pcm_data);
+            fclose(f);
+            return float_data;
+        }
+        else
+        {
+            fseek(f, chunk_size, SEEK_CUR); // Skip unknown chunks
+        }
     }
-    return ctx;
+    fclose(f);
+    return NULL;
 }
 
-void yin_destroy(YinContext *ctx)
+int main()
 {
-    if (!ctx)
-        return;
-    free(ctx->d);
-    free(ctx->dprime);
-    free(ctx);
-}
+    const char *filepath = "Happy-birthday-piano-music.wav";
+    int num_samples = 0, sr = 0;
 
-int yin_detect_pitch(
-    YinContext *ctx,
-    const float *signal,
-    int length,
-    float sr,
-    int t,
-    int W,
-    int tau_min,
-    int tau_max,
-    float thresh,
-    int local_radius,
-    int local_step,
-    int refine_radius,
-    YinPitch *out)
-{
-    if (!ctx || !signal || !out)
-        return 0;
-    if (sr <= 0.0f || length <= 0)
-        return 0;
-    if (W <= 0)
-        return 0;
-    if (tau_min < 1)
-        tau_min = 1;
-    if (tau_max < tau_min)
-        return 0;
-    if (tau_max > ctx->max_tau)
-        return 0;
-    if (local_step <= 0)
-        local_step = 1;
-    if (refine_radius < 0)
-        refine_radius = 0;
-
-    // ----- Step 6: best local estimate -----
-    if (local_radius > 0)
+    float *audio = load_wav_mono(filepath, &num_samples, &sr);
+    if (!audio)
     {
-        YinPitch best;
-        int have_best = 0;
-
-        int start = t - local_radius;
-        int end = t + local_radius;
-
-        for (int u = start; u <= end; u += local_step)
-        {
-            YinPitch tmp;
-            if (!yin_one_frame(ctx, signal, length, sr, u, W, tau_min, tau_max, thresh, &tmp))
-                continue;
-
-            if (!have_best || tmp.aperiodicity < best.aperiodicity)
-            {
-                best = tmp;
-                have_best = 1;
-            }
-        }
-
-        if (!have_best)
-            return 0;
-
-        // Refine around best tau (second pass with tighter tau bounds)
-        int center = (int)lroundf(best.tau);
-        int tau_min2 = center - refine_radius;
-        int tau_max2 = center + refine_radius;
-
-        if (tau_min2 < tau_min)
-            tau_min2 = tau_min;
-        if (tau_max2 > tau_max)
-            tau_max2 = tau_max;
-        if (tau_max2 < tau_min2)
-        {
-            *out = best;
-            return 1;
-        }
-
-        YinPitch refined;
-        if (!yin_one_frame(ctx, signal, length, sr, best.t_used, W, tau_min2, tau_max2, thresh, &refined))
-        {
-            *out = best;
-            return 1;
-        }
-
-        *out = refined;
+        printf("Error: Could not load WAV file.\n");
         return 1;
     }
 
-    // Step 6 disabled: single frame
-    return yin_one_frame(ctx, signal, length, sr, t, W, tau_min, tau_max, thresh, out);
+    printf("Loaded audio: %d samples at %d Hz\n", num_samples, sr);
+
+    FrameAnnotation *annotations = NULL;
+    int num_frames = 0;
+
+    process_audio_frames(
+        audio, num_samples, sr,
+        0, SCALE_MAJOR, 7,
+        40.0f, 2000.0f,
+        2048, 1024,
+        0.1f, 0.6f,
+        &annotations, &num_frames);
+
+    printf("\nDetected Frames (First 20 voiced):\n");
+    int printed = 0;
+    for (int i = 0; i < num_frames && printed < 20; i++)
+    {
+        if (annotations[i].midi != -1)
+        {
+            printf("Time: %5.2fs | Freq: %7.1f Hz | Note: %4s | In-Key: %d | Conf: %.2f\n",
+                   annotations[i].time_s, annotations[i].frequency_hz,
+                   annotations[i].note_with_octave, annotations[i].in_key, annotations[i].confidence);
+            printed++;
+        }
+    }
+
+    free_annotations(annotations);
+    free(audio);
+    return 0;
 }
