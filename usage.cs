@@ -18,7 +18,7 @@ public class YinPitchTracker : MonoBehaviour
         
         public int octave;
         
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 10)] 
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)] 
         public string note_with_octave;
         
         public int midi;

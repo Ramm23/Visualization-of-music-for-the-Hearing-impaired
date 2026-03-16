@@ -581,7 +581,7 @@ if __name__ == "__main__":
     print("SCRIPT:", Path(__file__).resolve(), flush=True)
     print("CWD:", os.getcwd(), flush=True)
 
-    path = r"PythonExample\Happy_Birthday.mp3"
+    path = r"PythonExample\Happy_Birthday.mp3" ""
     user_key = "C major"   # <- provide the key here
 
     # BIG SPEED WIN: downsample for analysis (still fine for pitch visualization)

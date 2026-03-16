@@ -14,7 +14,6 @@ extern "C"
 {
 #endif
 
-    // Struct to hold per-frame data, matching the Python logic
     typedef struct
     {
         float time_s;
@@ -22,13 +21,13 @@ extern "C"
         float confidence;
         char note[5];
         int octave;
-        char note_with_octave[10];
+        char note_with_octave[16];
         int midi;
         float cents_error;
+        float rms;
         bool in_key;
     } FrameAnnotation;
 
-    // Batch processes an audio buffer
     YIN_EXPORT void process_audio_frames(
         const float *audio,
         int num_samples,
@@ -45,7 +44,6 @@ extern "C"
         FrameAnnotation **out_annotations,
         int *out_count);
 
-    // Required to prevent memory leaks in Unity
     YIN_EXPORT void free_annotations(FrameAnnotation *annotations);
 
 #ifdef __cplusplus

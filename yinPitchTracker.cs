@@ -1,92 +1,110 @@
+using System;
+using System.Runtime.InteropServices;
 using UnityEngine;
 
-public class BallMusicVisualizer : MonoBehaviour
+public class YinPitchTracker : MonoBehaviour
 {
-    [Header("References")]
-    public YinPitchTracker pitchTracker;
-    public AudioSource audioSource;
-    public MeshRenderer ballRenderer;
-
-    [Header("Pitch to Y-Axis Settings")]
-    public float minY = 0f;
-    public float maxY = 10f;
-    public float minFreq = 40f;   // e.g., Low E (E1)
-    public float maxFreq = 2000f; // e.g., High B (B6)
-    public float smoothSpeed = 10f;
-
-    [Header("Amplitude to Brightness Settings")]
-    [ColorUsage(true, true)] // Enables HDR for "Glowing" effect
-    public Color baseColor = Color.white;
-    public float sensitivity = 50f;
-
-    private YinPitchTracker.FrameAnnotation[] analysisData;
-    private Material ballMaterial;
-
-    void Start()
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct FrameAnnotation
     {
-        ballMaterial = ballRenderer.material;
+        public float time_s;
+        public float frequency_hz;
+        public float confidence;
 
-        if (pitchTracker != null && audioSource.clip != null)
-        {
-            // Trigger the C processing we built
-            // analysisData = pitchTracker.AnalyzeClip(audioSource.clip); 
-            // Note: Ensure your AnalyzeClip returns the array!
-        }
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 5)]
+        public string note;
+
+        public int octave;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
+        public string note_with_octave;
+
+        public int midi;
+        public float cents_error;
+        public float rms;
+
+        [MarshalAs(UnmanagedType.I1)]
+        public bool in_key;
     }
 
-    void Update()
-    {
-        if (analysisData == null || !audioSource.isPlaying) return;
+    [DllImport("yin", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void process_audio_frames(
+        float[] audio, int num_samples, int sr,
+        int tonic_pc, int[] scale_intervals, int num_scale_intervals,
+        float fmin, float fmax, int frame_size, int hop_size, float thresh, float conf_thresh,
+        out IntPtr out_annotations, out int out_count);
 
-        float currentTime = audioSource.time;
-        UpdateBallPosition(currentTime);
-        UpdateBallBrightness();
+    [DllImport("yin", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void free_annotations(IntPtr annotations);
+
+    public FrameAnnotation[] AnalyzeClip(
+    AudioClip clip,
+    int tonicPc,
+    int[] scaleIntervals,
+    float fmin,
+    float fmax,
+    int frameSize,
+    int hopSize,
+    float thresh,
+    float confThresh)
+{
+    if (clip == null)
+        throw new ArgumentNullException(nameof(clip));
+
+    float[] interleaved = new float[clip.samples * clip.channels];
+    clip.GetData(interleaved, 0);
+
+    float[] mono = new float[clip.samples];
+
+    if (clip.channels == 1)
+    {
+        Array.Copy(interleaved, mono, clip.samples);
     }
-
-    void UpdateBallPosition(float time)
+    else
     {
-        // Find the frame closest to the current audio playback time
-        // In a production build, you'd use a binary search for performance
-        foreach (var frame in analysisData)
+        for (int i = 0; i < clip.samples; i++)
         {
-            if (frame.time_s >= time)
+            float sum = 0f;
+            for (int ch = 0; ch < clip.channels; ch++)
             {
-                if (frame.midi != -1) // If a note is actually detected
-                {
-                    // Map frequency logarithmically to 0.0 - 1.0 range
-                    float logFreq = Mathf.Log(frame.frequency_hz / minFreq, 2) / Mathf.Log(maxFreq / minFreq, 2);
-                    float targetY = Mathf.Lerp(minY, maxY, Mathf.Clamp01(logFreq));
-
-                    // Smooth the movement so it doesn't "teleport"
-                    Vector3 newPos = transform.position;
-                    newPos.y = Mathf.Lerp(newPos.y, targetY, Time.deltaTime * smoothSpeed);
-                    transform.position = newPos;
-                }
-                break;
+                sum += interleaved[i * clip.channels + ch];
             }
+            mono[i] = sum / clip.channels;
         }
     }
 
-    void UpdateBallBrightness()
+    IntPtr annotationsPtr;
+    int count;
+
+    process_audio_frames(
+        mono,
+        mono.Length,
+        clip.frequency,
+        tonicPc,
+        scaleIntervals,
+        scaleIntervals.Length,
+        fmin,
+        fmax,
+        frameSize,
+        hopSize,
+        thresh,
+        confThresh,
+        out annotationsPtr,
+        out count);
+
+    if (count <= 0 || annotationsPtr == IntPtr.Zero)
+        return Array.Empty<FrameAnnotation>();
+
+    var result = new FrameAnnotation[count];
+    int structSize = Marshal.SizeOf<FrameAnnotation>();
+
+    for (int i = 0; i < count; i++)
     {
-        // Placeholder Amplitude Algorithm: RMS (Root Mean Square)
-        // This calculates the current volume of the audio playing right now
-        float[] samples = new float[256];
-        audioSource.GetOutputData(samples, 0); // Get current wave snapshot
-        
-        float sum = 0;
-        for (int i = 0; i < samples.Length; i++) {
-            sum += samples[i] * samples[i];
-        }
-        float rms = Mathf.Sqrt(sum / samples.Length); // This is your "Amplitude"
-
-        // Map amplitude to Emission color (Brightness)
-        float emission = rms * sensitivity;
-        Color finalColor = baseColor * Mathf.LinearToGammaSpace(emission);
-        
-        ballMaterial.SetColor("_EmissionColor", finalColor);
-        
-        // Ensure the material is actually glowing (standard shader)
-        DynamicGI.SetEmissive(ballRenderer, finalColor);
+        IntPtr curr = IntPtr.Add(annotationsPtr, i * structSize);
+        result[i] = Marshal.PtrToStructure<FrameAnnotation>(curr);
     }
+
+    free_annotations(annotationsPtr);
+    return result;
+}
 }

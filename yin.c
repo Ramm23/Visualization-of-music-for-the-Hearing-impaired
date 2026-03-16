@@ -88,6 +88,19 @@ float parabolic_interpolation(const float *d, int tau, int tau_max)
     return (float)tau + 0.5f * (s0 - s2) / denom;
 }
 
+static float compute_rms(const float *buffer, int W)
+{
+    if (W <= 0)
+        return 0.0f;
+
+    double sum_sq = 0.0;
+    for (int i = 0; i < W; i++)
+    {
+        sum_sq += (double)buffer[i] * (double)buffer[i];
+    }
+
+    return sqrtf((float)(sum_sq / (double)W));
+}
 // --- Primary Entry Point (Unity & Main) ---
 
 void process_audio_frames(
@@ -116,6 +129,13 @@ void process_audio_frames(
     for (int i = 0; i < total_frames; i++)
     {
         int start = i * hop_size;
+
+        FrameAnnotation *ann = &(*out_annotations)[i];
+        ann->time_s = (float)start / sr;
+
+        // RMS from the same frame window
+        ann->rms = compute_rms(&audio[start], frame_size);
+
         difference_function(&audio[start], frame_size, tau_max, d);
         cmndf(d, tau_max);
 
@@ -126,8 +146,6 @@ void process_audio_frames(
         float confidence = fmaxf(0.0f, fminf(1.0f, 1.0f - aperiodicity));
         float f0 = (tau_hat > 0.0f) ? ((float)sr / tau_hat) : 0.0f;
 
-        FrameAnnotation *ann = &(*out_annotations)[i];
-        ann->time_s = (float)start / sr;
         ann->confidence = confidence;
 
         if (confidence >= conf_thresh && f0 >= fmin && f0 <= fmax)
@@ -142,7 +160,8 @@ void process_audio_frames(
             ann->octave = (midi_round / 12) - 1;
 
             strncpy(ann->note, NOTE_NAMES_SHARP[pitch_class], 5);
-            snprintf(ann->note_with_octave, 10, "%s%d", ann->note, ann->octave);
+            ann->note[4] = '\0';
+            snprintf(ann->note_with_octave, sizeof(ann->note_with_octave), "%s%d", ann->note, ann->octave);
             ann->in_key = (key_mask & (1 << pitch_class)) != 0;
         }
         else
