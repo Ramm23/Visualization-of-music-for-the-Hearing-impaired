@@ -30,7 +30,12 @@ public class BallMusicVisualizer : MonoBehaviour
     void Start()
     {
         ballMaterial = ballRenderer.material;
+        GetComponent<Renderer>().material.color = new Color(0.4f, 0.5f, 0.7f);
         ballMaterial.EnableKeyword("_EMISSION");
+        if (ballMaterial.HasProperty("_BaseColor"))
+            ballMaterial.SetColor("_BaseColor", Color.blue);
+        else if (ballMaterial.HasProperty("_Color"))
+            ballMaterial.SetColor("_Color", Color.blue);
 
         if (pitchTracker != null && audioSource != null && audioSource.clip != null)
         {
@@ -98,29 +103,14 @@ public class BallMusicVisualizer : MonoBehaviour
 
     void UpdateBallVisuals(YinPitchTracker.FrameAnnotation frame)
     {
-        float targetAmplitude = Mathf.Clamp01(frame.rms * amplitudeScale);
-        smoothedAmplitude = Mathf.Lerp(
-            smoothedAmplitude,
-            targetAmplitude,
-            Time.deltaTime * amplitudeSmoothSpeed
-        );
-
-        // Emission / brightness
-        Color emissionColor = baseColor * smoothedAmplitude;
-        if (ballMaterial.HasProperty("_EmissionColor"))
-        {
-            ballMaterial.SetColor("_EmissionColor", emissionColor);
-            DynamicGI.SetEmissive(ballRenderer, emissionColor);
-        }
-
-        // Transparency
-        float alpha = Mathf.Lerp(minAlpha, maxAlpha, smoothedAmplitude);
-        Color surfaceColor = baseColor;
-        surfaceColor.a = alpha;
+        float t = Mathf.Clamp01(frame.rms * 10f);
+        Color surface = Color.Lerp(baseColor, Color.white, t); //Should pass on the hue from the base color instead of hardcoding blue to match timbre
 
         if (ballMaterial.HasProperty("_BaseColor"))
-            ballMaterial.SetColor("_BaseColor", surfaceColor);
+            ballMaterial.SetColor("_BaseColor", surface);
         else if (ballMaterial.HasProperty("_Color"))
-            ballMaterial.SetColor("_Color", surfaceColor);
-    }
-}
+            ballMaterial.SetColor("_Color", surface);
+
+        if (ballMaterial.HasProperty("_EmissionColor"))
+            ballMaterial.SetColor("_EmissionColor", surface * t);
+}}
