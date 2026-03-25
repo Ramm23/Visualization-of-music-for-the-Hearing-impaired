@@ -1,3 +1,4 @@
+using System.Net;
 using UnityEngine;
 
 public class BallMusicVisualizer : MonoBehaviour
@@ -12,30 +13,24 @@ public class BallMusicVisualizer : MonoBehaviour
     public float maxY = 10f;
     public float minFreq = 40f;
     public float maxFreq = 2000f;
-    public float smoothSpeed = 10f;
 
     [Header("Amplitude Visual Settings")]
     [ColorUsage(true, true)]
     public Color baseColor = Color.white;
-    public float amplitudeScale = 25f;
-    public float minAlpha = 0.2f;
-    public float maxAlpha = 1.0f;
-    public float amplitudeSmoothSpeed = 12f;
 
     private YinPitchTracker.FrameAnnotation[] analysisData;
     private Material ballMaterial;
     private int currentFrameIndex = 0;
-    private float smoothedAmplitude = 0f;
+
+    // ✅ Precomputed data
+    private float[] precomputedY;
+    private Color[] precomputedColor;
+    private Color[] precomputedEmission;
 
     void Start()
     {
         ballMaterial = ballRenderer.material;
-        GetComponent<Renderer>().material.color = new Color(0.4f, 0.5f, 0.7f);
         ballMaterial.EnableKeyword("_EMISSION");
-        if (ballMaterial.HasProperty("_BaseColor"))
-            ballMaterial.SetColor("_BaseColor", Color.blue);
-        else if (ballMaterial.HasProperty("_Color"))
-            ballMaterial.SetColor("_Color", Color.blue);
 
         if (pitchTracker != null && audioSource != null && audioSource.clip != null)
         {
@@ -50,6 +45,63 @@ public class BallMusicVisualizer : MonoBehaviour
                 0.1f,
                 0.6f
             );
+
+            PrecomputeFrames(); // 🚀 Important
+        }
+    }
+
+
+    // DIFFERENCES -- changed computation of Y position from update to start for less lag
+    void PrecomputeFrames()
+    {
+        int length = analysisData.Length;
+        float smoothingFactor = 0.1f; // Adjust for more or less smoothing
+
+        precomputedY = new float[length];
+        precomputedColor = new Color[length];
+        precomputedEmission = new Color[length];
+
+        float logDenominator = Mathf.Log(maxFreq / minFreq, 2f);
+        float lastValidY = transform.position.y;
+        // DIFFERENCES -- added buffering logic to handle sudden drops in frequency and prevent jittery movement
+        int fBuffer = 0;
+        float lastFreq = analysisData[0].frequency_hz;
+        for (int i = 0; i < length; i++)
+        {
+            var frame = analysisData[i];
+            float freq = frame.frequency_hz;
+
+            if (frame.midi == -1 || frame.frequency_hz <= minFreq)
+            {
+                precomputedY[i] = lastValidY; // 👈 smooth fallback
+            }
+            else if ((freq < lastFreq - 1 || freq > lastFreq + 1) && fBuffer < 10) // --- Buffering logic to handle sudden drops ---
+            {
+                precomputedY[i] = lastValidY; // 👈 hold previous value
+                fBuffer++;
+            } else 
+            {
+
+                float logFreq = Mathf.Log(frame.frequency_hz / minFreq, 2f) / logDenominator;
+                float normalized = Mathf.Clamp01(logFreq);
+                float y = Mathf.Lerp(minY, maxY, normalized);
+                Debug.Log("Y position: " + frame.frequency_hz);
+
+                precomputedY[i] = y;
+                lastValidY = y; // 👈 update
+                fBuffer = 0; // 👈 reset buffer
+                lastFreq = freq;
+            }
+            float t = Mathf.Clamp01(frame.rms * 10f);
+            Color surface = Color.Lerp(baseColor, Color.white, t);
+
+            precomputedColor[i] = surface;
+            precomputedEmission[i] = surface * t;
+        }
+        // DIFFERENCES -- replaced smoothing in the code
+        for (int i = 1; i < length; i++)
+        {
+            precomputedY[i] = Mathf.Lerp(precomputedY[i - 1], precomputedY[i], smoothingFactor);
         }
     }
 
@@ -60,13 +112,28 @@ public class BallMusicVisualizer : MonoBehaviour
 
         float currentTime = audioSource.time;
         int frameIndex = GetFrameIndexAtTime(currentTime);
+
         if (frameIndex < 0)
             return;
 
-        var frame = analysisData[frameIndex];
+        ApplyPrecomputedFrame(frameIndex);
+    }
 
-        UpdateBallPosition(frame);
-        UpdateBallVisuals(frame);
+    void ApplyPrecomputedFrame(int index)
+    {
+        // --- Position (no math, just assignment) ---
+        Vector3 pos = transform.position;
+        pos.y = precomputedY[index];
+        transform.position = pos;
+
+        // --- Visuals (no math) ---
+        if (ballMaterial.HasProperty("_BaseColor"))
+            ballMaterial.SetColor("_BaseColor", precomputedColor[index]);
+        else if (ballMaterial.HasProperty("_Color"))
+            ballMaterial.SetColor("_Color", precomputedColor[index]);
+
+        if (ballMaterial.HasProperty("_EmissionColor"))
+            ballMaterial.SetColor("_EmissionColor", precomputedEmission[index]);
     }
 
     int GetFrameIndexAtTime(float time)
@@ -85,32 +152,4 @@ public class BallMusicVisualizer : MonoBehaviour
 
         return currentFrameIndex;
     }
-
-    void UpdateBallPosition(YinPitchTracker.FrameAnnotation frame)
-    {
-        if (frame.midi == -1 || frame.frequency_hz <= 0f)
-            return;
-
-        float logFreq = Mathf.Log(frame.frequency_hz / minFreq, 2f) /
-                        Mathf.Log(maxFreq / minFreq, 2f);
-
-        float targetY = Mathf.Lerp(minY, maxY, Mathf.Clamp01(logFreq));
-
-        Vector3 newPos = transform.position;
-        newPos.y = Mathf.Lerp(newPos.y, targetY, Time.deltaTime * smoothSpeed);
-        transform.position = newPos;
-    }
-
-    void UpdateBallVisuals(YinPitchTracker.FrameAnnotation frame)
-    {
-        float t = Mathf.Clamp01(frame.rms * 10f);
-        Color surface = Color.Lerp(baseColor, Color.white, t); //Should pass on the hue from the base color instead of hardcoding blue to match timbre
-
-        if (ballMaterial.HasProperty("_BaseColor"))
-            ballMaterial.SetColor("_BaseColor", surface);
-        else if (ballMaterial.HasProperty("_Color"))
-            ballMaterial.SetColor("_Color", surface);
-
-        if (ballMaterial.HasProperty("_EmissionColor"))
-            ballMaterial.SetColor("_EmissionColor", surface * t);
-}}
+}
